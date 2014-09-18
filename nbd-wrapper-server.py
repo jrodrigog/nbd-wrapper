@@ -18,7 +18,7 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
 '''
 
-__version__ = '0.0.2'
+__version__ = '0.0.3'
 __author__ = 'Juan Carlos Rodrigo'
 __copyright__ = '(C) 2014 Juan Carlos Rodrigo'
 
@@ -71,24 +71,27 @@ WAIT_INTERVAL = 0.05
 EXPORT_MARK = 'export:'
 CONTENT_TYPE = 'Content-type'
 TEXT_PLAIN = 'text/plain'
-OK_200, ERROR_500 = (200, 500)
+OK_200 = 200
 ADD, REMOVE = range(2)
 REDUCE_SLEEP = 0.8
 NBD_WRAPPER_USER = 'nbdwrap'
 NBD_WRAPPER_GROUP = NBD_WRAPPER_USER
+KEY_MEDIA = '_media'
+DEFAULT_MEDIA = 'ID_DRIVE_FLASH'
 
 # These are the UDEV rules used to launch the wrapper when devices become
 # present and remove them when they are unplugged or ejected
 UDEV_RULES = '''\
 # CDROM/DVD rules
-ACTION=="change", SUBSYSTEM=="block", KERNEL=="sr[0-9]*|xvd*", ENV{DEVTYPE}=="disk", ENV{DISK_MEDIA_CHANGE}=="?*", GROUP:="%(group)s", MODE:="0660", RUN+="%(wrapper_sh)s --add /dev/%%k readonly=true"
+ACTION=="change", SUBSYSTEM=="block", KERNEL=="sr[0-9]*|xvd*", ENV{DEVTYPE}=="disk", ENV{ID_FS_USAGE}=="?*", ENV{DISK_MEDIA_CHANGE}=="?*", GROUP="%(group)s", MODE="0660", RUN+="%(wrapper_sh)s --add /dev/%%k _media=ID_CDROM readonly=true"
 ACTION=="change", SUBSYSTEM=="block", KERNEL=="sr[0-9]*|xvd*", ENV{DEVTYPE}=="disk", ENV{DISK_EJECT_REQUEST}=="?*", RUN+="%(wrapper_sh)s --remove /dev/%%k"
+ACTION=="change", SUBSYSTEM=="block", KERNEL=="sr[0-9]*|xvd*", ENV{DEVTYPE}=="disk", ENV{ID_FS_USAGE}=="", RUN+="%(wrapper_sh)s --remove /dev/%%k"
 # Floppy disk rules
-ACTION=="change", SUBSYSTEM=="block", KERNEL=="fd[0-9]", ENV{DISK_MEDIA_CHANGE}=="?*", GROUP:="%(group)s", MODE:="0660", RUN+="%(wrapper_sh)s --add /dev/%%k sync=true flush=true"
-ACTION=="change", SUBSYSTEM=="block", KERNEL=="fd[0-9]", ENV{DISK_EJECT_REQUEST}=="?*", ENV{DISK_EJECT_REQUEST}=="?*", RUN+="%(wrapper_sh)s --remove /dev/%%k"
+ACTION=="change", SUBSYSTEM=="block", ENV{ID_TYPE}=="floppy", ENV{DEVTYPE}=="disk", ENV{ID_FS_USAGE}=="?*", GROUP="%(group)s", MODE="0660", RUN+="%(wrapper_sh)s --add /dev/%%k _media=ID_DRIVE_FLOPPY sync=true flush=true"
+ACTION=="change", SUBSYSTEM=="block", ENV{ID_TYPE}=="floppy", ENV{DEVTYPE}=="disk", ENV{ID_FS_USAGE}=="", RUN+="%(wrapper_sh)s --remove /dev/%%k"
 # USB disk rules
-ACTION=="add", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", ENV{DEVTYPE}=="disk", GROUP:="%(group)s", MODE:="0660", RUN+="%(wrapper_sh)s --add /dev/%%k sync=true flush=true"
-ACTION=="remove", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", ENV{DEVTYPE}=="disk", RUN+="%(wrapper_sh)s --remove /dev/%%k"
+ACTION=="add", SUBSYSTEM=="block", ENV{ID_PATH}=="*-usb-*", ENV{DEVTYPE}=="disk", GROUP="%(group)s", MODE="0660", RUN+="%(wrapper_sh)s --add /dev/%%k _media=ID_DRIVE_FLASH sync=true flush=true"
+ACTION=="remove", SUBSYSTEM=="block", ENV{ID_PATH}=="*-usb-*", ENV{DEVTYPE}=="disk", RUN+="%(wrapper_sh)s --remove /dev/%%k"
 '''
 
 # Helper shell used to start the wrapper server from UDEV
@@ -106,7 +109,7 @@ def locked(f):
     return dec
 
 class QueryHandler(BaseHTTPRequestHandler):
-    'This class serves the nbd configuration file.'
+    'This class serves the nbd configuration file to the nbd-wrapper clients.'
 
     def log_request(self, *args): pass
     def log_error(self, *args): pass
@@ -123,18 +126,26 @@ class QueryHandler(BaseHTTPRequestHandler):
         return open(self.server.config_file, 'rb').read()
 
     def do_GET(self):
+        '''Returns the nbd-server configuration file to the
+        nbd-wrapper client. If the nbd-wrapper passes the sleep
+        query string parameter we sleep until the given time has passed
+        or return at once reading the latest configuration file.
+        This scheme avoids a busy poll on the client and at the
+        same time serves the 'plug' and 'unplug' events with no delay.'''
         query_string = urlparse.parse_qs(
             urlparse.urlparse(self.path).query)
         self.send_response(OK_200)
         self.send_header(CONTENT_TYPE, TEXT_PLAIN)
         self.end_headers()
         try:
+            # Sleep if the nbd-wrapper client has requested todo so
             sleep = float(query_string[QS_SLEEP][0])
             self.server.event.wait(sleep * REDUCE_SLEEP)
             self.server.event.clear()
         except (AttributeError, ValueError, KeyError):
             pass
         try:
+            # Send the ndb-server configuration file to the client
             config = self._read_config()
             self.wfile.write(config)
         except (OSError, IOError):
@@ -142,7 +153,7 @@ class QueryHandler(BaseHTTPRequestHandler):
 
 class ExportServer(HTTPServer):
     '''This is the HTTP server that provides an up-to-date nbd
-    configuration file to the remove ndb wrapper client.'''
+    configuration file to the remove ndb-wrapper client.'''
 
     def __init__(self, worker, server_address,
                  config_file, pid_file, lock_file):
@@ -168,7 +179,7 @@ class ExportServer(HTTPServer):
 
         os.chdir('/')
         os.setsid()
-        os.umask(0)
+        os.umask(0o007)
 
         try:
             pid = os.fork()
@@ -216,9 +227,9 @@ class ExportServer(HTTPServer):
 
 class Server(object):
     '''This class:
-        Creates a default configuration file if needed.
-        Handles the nbd server operations (start, stop, reload).
-        Updates the configuration to add and remove exports.'''
+        + Creates a default configuration file if needed.
+        + Handles the nbd server operations (start, stop, reload).
+        + Updates the configuration to add and remove exports.'''
     def __init__(self,
                  config_file=DEF_CONFIG_FILE,
                  lock_file=DEF_LOCK_FILE,
@@ -241,7 +252,7 @@ class Server(object):
 
     @property
     def nbd_pid(self):
-        'Returns the current server pid from the pid file'
+        'Returns the current server pid from the nbd-server pid file'
         if self._nbd_pid == None:
             try:
                 self._nbd_pid = int(
@@ -252,7 +263,7 @@ class Server(object):
 
     @property
     def own_pid(self):
-        'Returns the exports HTTP server pid from the pid file'
+        'Returns the HTTP server pid (our own pid)'
         if self._own_pid == None:
             try:
                 self._own_pid = int(
@@ -274,7 +285,7 @@ class Server(object):
         return False
 
     def _safe_start(self, pid, callback):
-        'Start a daemon if it is not running'
+        'Start a daemon (via the callback) if it is not running'
         if pid == None:
             callback()
         else:
@@ -315,7 +326,7 @@ class Server(object):
         return cfg
 
     def _touch_run_files(self):
-        'Creates the /run files and gives the nbdwrapper user access to them'
+        'Creates the /var/run files and gives the nbdwrap user access to them'
         gid = grp.getgrnam(NBD_WRAPPER_GROUP).gr_gid
         for file_name in (self.config_file, self.lock_file,
                           self.nbd_pid_file, self.own_pid_file):
@@ -328,7 +339,7 @@ class Server(object):
                 pass
 
     def _drop_privileges(self):
-        'Drop user privileges to the nbbwrapper user and group'
+        'Drop user privileges to the nbbwrap user and group'
         os.setgroups([])
         os.setgid(grp.getgrnam(NBD_WRAPPER_GROUP).gr_gid)
         os.setuid(pwd.getpwnam(NBD_WRAPPER_USER).pw_uid)
@@ -402,7 +413,7 @@ class Server(object):
             pass
 
     def stop_server(self):
-        'Stop the nbd server, called from the daemon atexit (unlocked)'
+        'Stop the nbd server, called from atexit (unlocked)'
         if self.nbd_pid != None:
             try:
                 os.kill(self.nbd_pid, signal.SIGTERM)
@@ -410,7 +421,7 @@ class Server(object):
                 pass
 
     def stop(self):
-        'Stop the servers if they are alive (unlocked)'
+        'Stop the server if it is alive (unlocked)'
         if self.own_pid != None:
             try:
                 os.kill(self.own_pid, signal.SIGTERM)
@@ -426,13 +437,24 @@ class Server(object):
 
     @locked
     def add(self, device):
-        'Add a device to the config file and HUP the server (locked)'
+        'Add a device to the config file and HUP the nbd-server (locked)'
         self._update_config(device, ADD)
 
     @locked
     def remove(self, device):
         'Remove a device from the config file (locked)'
         self._update_config(device, REMOVE)
+
+def parse_options(args):
+    'Parse any custom key=value options for the nbd-server'
+    export_options = {KEY_MEDIA: DEFAULT_MEDIA}
+    for arg in args:
+        m = RE_KEY_VALUE.match(arg)
+        if m != None:
+            export_options[m.group('key')] = m.group('value')
+        else:
+            sys.stderr.write('bad option %s should be key=value\n' % arg)
+    return export_options
 
 def install(options):
     '''Installs this software by:
@@ -445,7 +467,6 @@ def install(options):
         This installer does not change any existing system files.
     '''
     re_extension = re.compile(r'(\.[^\.]+)*$')
-    nbd_server = ''
     udev_base = '/etc/udev/rules.d'
     base = '/usr/local/bin'
     home = '/dev/null'
@@ -483,15 +504,15 @@ def install(options):
 
     if not os.path.isdir(udev_base):
         sys.stderr.write(
-            'ERROR: The UDEV rules directory %s does not exists.\n'
+            'ERROR: The UDEV rules directory %s does not exists.\n' \
             'Is UDEV installed on this system?\n' % udev_base)
         return 10
 
     if not os.path.exists(options.nbd_server_binary):
         sys.stderr.write(
-            'ERROR: The binary file %s does not exists.\n'
-            'Please, specify the option --nbd-server-binary '
-            'pointing to the nbd server binary.\n')
+            'ERROR: The binary file %s does not exists.\n' \
+            'Please, specify the option --nbd-server-binary ' \
+            'pointing to the nbd server binary.\n' % options.nbd_server_binary)
         return 11
 
     # Create an unprivileged group and user
@@ -522,12 +543,12 @@ def install(options):
             print('file %s ready.' % wrapper_py)
         except (OSError, IOError):
             sys.stderr.write(
-                'ERROR: Cannot write the file %s, '
+                'ERROR: Cannot write the file %s, ' \
                 'you should run the installer as root.\n' % wrapper_py)
             return 11
     else:
         sys.stderr.write(
-            'ERROR: Cannot find the directory %s, '
+            'ERROR: Cannot find the directory %s, ' \
             'you should run the installer as root.\n' % base)
         return 11
 
@@ -541,7 +562,7 @@ def install(options):
         print('file %s ready.' % wrapper_sh)
     except (OSError, IOError):
         sys.stderr.write(
-            'ERROR: Cannot write %s, '
+            'ERROR: Cannot write %s, ' \
             'you should run the installer as root.\n' % wrapper_sh)
         return 12
 
@@ -556,31 +577,22 @@ def install(options):
         print('file %s ready.' % udev_rules)
     except (OSError, IOError):
         sys.stderr.write(
-            'ERROR: Cannot write %s, '
+            'ERROR: Cannot write %s, ' \
             'you should run the installer as root.\n' % udev_rules)
         return 13
 
     print('''
 You can add these lines to the syslog-ng.conf file just under the
-"source src {...}" section because the nbd-client could get very verbose:
+"source src {...}" section because the nbd-server could get very verbose:
 
- destination discard { file("/dev/null" owner(root) group(root) perm(0666) dir_perm(0755) create_dirs(no)); };
+ destination discard {
+    file("/dev/null" perm(0666) dir_perm(0755) create_dirs(no));
+ };
  filter nbd { program("nbd_server"); };
  log { source(src); filter(nbd); destination(discard); flags(final); };
 ''')
 
     return 0
-
-def parse_options(args):
-    # Parse the key=value options for the nbd server config file
-    export_options = dict()
-    for arg in args:
-        m = RE_KEY_VALUE.match(arg)
-        if m != None:
-            export_options[m.group('key')] = m.group('value')
-        else:
-            sys.stderr.write('bad option %s should be key=value\n' % arg)
-    return export_options
 
 def main():
     parser = optparse.OptionParser(description='''\
@@ -621,7 +633,7 @@ under certain conditions.''', version='%%prog %s' % __version__)
                         help='the pid file for the nbd-wrapper server')
     parser.add_option('-D', '--wait-device', dest='wait_device',
                         action='store', type="int", default=DEF_WAIT_DEVICE,
-                        help='waits this seconds for device creation')
+                        help='waits this time, in seconds, for devices')
     parser.add_option('-I', '--install', dest='install', action='store_true',
                         default=False,
                         help='installs this software')

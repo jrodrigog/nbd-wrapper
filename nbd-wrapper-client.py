@@ -18,12 +18,12 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
 '''
 
-__version__ = '0.0.2'
+__version__ = '0.0.3'
 __author__ = 'Juan Carlos Rodrigo'
 __copyright__ = '(C) 2014 Juan Carlos Rodrigo'
 
 import optparse, signal, subprocess, threading, pwd
-import re, os, sys, glob, time, socket
+import re, os, sys, glob, time, socket, fcntl
 import multiprocessing as mp
 try:
     from subprocess import DEVNULL
@@ -42,8 +42,11 @@ DEF_BLOCK_SIZE = '1024'
 DEF_NBD_CLIENT = '/usr/sbin/nbd-client'
 DEF_UDEVADM = '/bin/udevadm'
 DEF_PID_FILE = '.nbd-wrapper.pid'
+DEF_LOCK_FILE = '/var/run/nbd-wrapper-media.lock'
+DEF_CONFIG_FILE = '/var/run/nbd-wrapper-media.conf'
 
 ERROR_WAIT = 1
+LOOP_SLEEP = 1
 ENCODING = 'utf-8'
 QS_SLEEP = 'sleep'
 HTTP_GET = 'GET /%s HTTP/1.1\r\n\r\n'
@@ -56,6 +59,8 @@ PLUGDEV_GROUP = 'plugdev'
 SUDO_GID = 'SUDO_GID'
 SUDO_UID = 'SUDO_UID'
 HOME = 'HOME'
+KEY_MEDIA = '_media'
+MEDIA_SECTION = 'DEFAULT'
 
 # These are the UDEV rules required for the system to work.
 # The nbd devices are excluded on the default UDEV rules so we need
@@ -63,18 +68,18 @@ HOME = 'HOME'
 UDEV_RULES = '''\
 # treat nbd devices as normal devices by reading its partitions
 KERNEL!="nbd*", GOTO="persistent_storage_end_nbd"
+ENV{UDISKS_AUTO}="0", ENV{UDISKS_IGNORE}="1", ENV{UDISKS_SYSTEM}="1", ENV{UDISKS_PRESENTATION_HIDE}="1"
 # no action if removing the device
 ACTION=="remove", GOTO="persistent_storage_end_nbd"
 # enable in-kernel media-presence polling, poll often the disk can dissapear without warning
 ACTION=="add", SUBSYSTEM=="module", KERNEL=="block", ATTR{parameters/events_dfl_poll_msecs}="500"
 SUBSYSTEM!="block", GOTO="persistent_storage_end_nbd"
 # skip rules for inappropriate block devices
-ENV{UDISKS_AUTO}:="0", ENV{UDISKS_IGNORE}:="0", ENV{UDISKS_SYSTEM}:="0"
-ENV{DEVTYPE}=="disk", ENV{ID_VENDOR}:="nbd", ENV{ID_SERIAL}:="%k", ENV{ID_DRIVE_FLASH}:="1"
+ENV{DEVTYPE}=="disk", ENV{ID_VENDOR}="nbd", ENV{ID_SERIAL}="%%k", IMPORT{program}="%(wrapper_py)s --media-type /dev/%%k"
 # ignore partitions that span the entire disk
 TEST=="whole_disk", GOTO="persistent_storage_end_nbd"
 # for partitions import parent information
-ENV{DEVTYPE}=="partition", IMPORT{parent}="ID_*"
+ENV{DEVTYPE}=="partition", IMPORT{parent}="ID_*", IMPORT{parent}="UDISKS_*"
 IMPORT{builtin}="blkid"
 # watch metadata changes by tools closing the device after writing
 OPTIONS+="watch"
@@ -96,7 +101,7 @@ LABEL="persistent_storage_end_nbd"
 XINIT_CLIENT = '''\
 #!/bin/sh
 server=`echo $DISPLAY | cut -d : -f 1`
-echo -n "$server" | grep '^[12][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[12][0-9]*$' &>/dev/null
+echo -n "$server" | grep '^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*$' &>/dev/null
 [ $? == 0 ] && sudo %(wrapper_sh)s "$server"
 '''
 
@@ -104,8 +109,8 @@ echo -n "$server" | grep '^[12][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[12][0-9]*$' &>
 # client will be called only with the appropiate parameters.
 SAFE_SHELL = '''\
 #!/bin/sh
-echo -n "$1" | grep '^[12][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[12][0-9]*$' &>/dev/null
-[ $? == 0 ] && %(wrapper_py)s -s "$1" %(port)s%(timeout)s%(nbd)s%(udev)s%(interval)s%(block)s%(pid)s&
+echo -n "$1" | grep '^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*$' &>/dev/null
+[ $? == 0 ] && %(wrapper_py)s -s "$1" %(port)s%(timeout)s%(config)s%(lock)s%(nbd)s%(udev)s%(interval)s%(block)s%(pid)s&
 '''
 
 # Currently it is impossible to use the nbd-client binary without root
@@ -113,18 +118,34 @@ echo -n "$1" | grep '^[12][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[12][0-9]*$' &>/dev/
 # users without system capabilities are disallowed on the nbd Kernel module.
 # This sudoers line exactly matches the safe shell command above.
 SUDOERS_LINE = '''\
-%%%(plugdev)s ALL = NOPASSWD: %(wrapper_sh)s [12]*.[0-9]*.[0-9]*.[12]*
+%%%(plugdev)s ALL = NOPASSWD: %(wrapper_sh)s [0-9]*.[0-9]*.[0-9]*.[0-9]*
 '''
 
 # We need a shutdown script either in
 # /etc/kde/shutdown or /etc/gdm/PostSession/Default
 SHUTDOWN_SHELL = '''\
 #!/bin/sh
-kill -TERM `cat "$HOME/%(xpid)s"`
+declare -l host
+host=`hostname`
+server=`echo $DISPLAY | cut -d : -f 1`
+pid_file="$HOME/%(xpid)s-$server-$host"
+[ -e "$pid_file" ] && kill -TERM `cat "$pid_file"`
 '''
 
+def locked(f):
+    'This decorator locks a file before calling the decorated function.'
+    def dec(self, *args):
+        lock = open(self.lock_file, 'w')
+        fcntl.lockf(lock, fcntl.LOCK_EX)
+        return f(self, *args)
+    return dec
+
+class NoFreeDevices(Exception):
+    'There are no free nbd devices.'
+    pass
+
 class Stopper(threading.Thread):
-    'This class waits for the '
+    'This class waits for the unprivileged process stop command.'
     def __init__(self, worker, queue):
         threading.Thread.__init__(self)
         self.worker = worker
@@ -132,6 +153,7 @@ class Stopper(threading.Thread):
         self.start()
 
     def run(self):
+        'Wait for the stop command (the only message on the queue).'
         self.queue.get()
         self.worker.stop()
 
@@ -143,6 +165,8 @@ class Worker(mp.Process):
     def __init__(self, queue, server,
                  port=DEF_EXPORTS_PORT,
                  nbd_timeout=DEF_NBD_TIMEOUT,
+                 config_file=DEF_CONFIG_FILE,
+                 lock_file=DEF_LOCK_FILE,
                  nbd_client_binary=DEF_NBD_CLIENT,
                  udevadm_binary=DEF_UDEVADM,
                  poll_interval=DEF_POLL_INTERVAL,
@@ -152,6 +176,8 @@ class Worker(mp.Process):
         self.server = server
         self.port = port
         self.nbd_timeout = nbd_timeout
+        self.config_file = config_file
+        self.lock_file = lock_file
         self.exports_addr = (self.server, self.port)
         self.nbd_client_binary = nbd_client_binary
         self.udevadm_binary = udevadm_binary
@@ -170,8 +196,8 @@ class Worker(mp.Process):
 
     def stop(self):
         'Stop the process, close the HTTP socket and stop the loop'
-        self.error_wait.set()
         self.leave = True
+        self.error_wait.set()
         try:
             self.socket.shutdown(socket.SHUT_RDWR)
             self.socket.close()
@@ -187,34 +213,47 @@ class Worker(mp.Process):
             self._do_remove(export)
         self.started = False
 
-    def _add(self, export, device):
+    @locked
+    def _add(self, export, device, media_type):
         'Add an export to the internal structures.'
-        self.devices.remove(device)
-        self.exports[export] = device
+        try:
+            self.devices.remove(device)
+            self.exports[export] = device
+            # Save the media type on the config file
+            cfg = configparser.ConfigParser()
+            try: cfg.read(self.config_file)
+            except configparser.Error: pass
+            cfg.set(MEDIA_SECTION, device, media_type)
+            cfg.write(open(self.config_file, 'w'))
+        except (OSError, IOError):
+            pass
 
+    @locked
     def _remove(self, export):
         'Remove the export from the internal structures.'
         device = None
         try:
             device = self.exports.pop(export)
             self.devices.append(device)
-        except KeyError:
+            # Remove the media type from the config file
+            cfg = configparser.ConfigParser()
+            try: cfg.read(self.config_file)
+            except configparser.Error: pass
+            try: cfg.remove_option(MEDIA_SECTION, device)
+            except configparser.Error: pass
+            cfg.write(open(self.config_file, 'w'))
+        except (KeyError, OSError, IOError):
             pass
         return device
 
-    def _do_add(self, export):
+    def _do_add(self, export, media_type):
         '''add an export: get a free device, run the nbd-client,
-        trigger the udev rule and store the export as using the
+        trigger the udev rules and store the export as using the
         found device.'''
 
         # look for a free device
+        found = False
         for device in self.devices:
-            # check if its in use
-            if subprocess.Popen([self.nbd_client_binary, '-c', device],
-                                stdout=DEVNULL, stderr=DEVNULL,
-                                close_fds=True).wait() != 1:
-                continue
-
             # run the nbd-client and check that returns 0
             if subprocess.Popen([self.nbd_client_binary,
                                 self.server, device,
@@ -226,7 +265,9 @@ class Worker(mp.Process):
                                 close_fds=True).wait() != 0:
                 continue
 
-            # mark the device as used and return
+            # mark the device as used, save the media type too
+            self._add(export, device, media_type)
+
             sysname = os.path.split(device)[1]
             subprocess.Popen([self.udevadm_binary,
                         'trigger', '--action=add',
@@ -234,9 +275,11 @@ class Worker(mp.Process):
                         '--sysname-match=%sp*' % sysname],
                         stdout=DEVNULL, stderr=DEVNULL,
                         close_fds=True).wait()
-
-            self._add(export, device)
+            found = True
             break
+
+        if not found:
+            raise NoFreeDevices()
 
     def _do_remove(self, export):
         '''remove the export, add the device to
@@ -252,7 +295,7 @@ class Worker(mp.Process):
                             '--sysname-match=%s' % sysname],
                             stdout=DEVNULL, stderr=DEVNULL,
                             close_fds=True).wait()
-            # Stop the clients
+            # Stop the client
             subprocess.Popen([self.nbd_client_binary, '-d', device],
                             stdout=DEVNULL, stderr=DEVNULL,
                             close_fds=True).wait()
@@ -280,23 +323,32 @@ class Worker(mp.Process):
             self.socket.close()
             self.started = True
             # Search changes in the exports
+            media_type = dict()
             local_exports = set(self.exports.keys())
             remote_exports = set()
             mark_len = len(EXPORT_MARK)
             for section in cfg.sections():
                 if section[:mark_len] == EXPORT_MARK:
-                    remote_exports.add(section)
+                    try:
+                        media_type[section] = cfg.get(section, KEY_MEDIA)
+                        remote_exports.add(section)
+                    except configparser.Error:
+                        pass
             added = remote_exports - local_exports
             removed = local_exports - remote_exports
             for export in removed:
                 self._do_remove(export)
             for export in added:
-                self._do_add(export)
+                self._do_add(export, media_type[export])
+        except NoFreeDevices:
+            # Wait a bit
+            self.error_wait.wait(ERROR_WAIT)
+            self.error_wait.clear()
         except (configparser.Error, socket.error):
             # Stop everything so we fire all the connected
             # devices when the server comes up again
             self._stop_clients()
-            # Wait a bit if we cannot connect
+            # Wait a bit
             self.error_wait.wait(ERROR_WAIT)
             self.error_wait.clear()
 
@@ -308,6 +360,7 @@ class Worker(mp.Process):
             try:
                 self._query()
             except:
+                # Wait a bit, something wrong happened
                 self.error_wait.wait(ERROR_WAIT)
                 self.error_wait.clear()
         # Stop all the nbd-clients on exit
@@ -315,62 +368,104 @@ class Worker(mp.Process):
 
 class Client(object):
     '''This is the client class, it starts the privileged Server
-    and after that drops privileges to be able to listen for a TERM signal
-    from an unprivileged user (the user that is running the X session).
+    and after that drops privileges, this scheme keeps us able to
+    listen for the TERM signal from an unprivileged user, that is
+    the user running the X session.
     This class only task is to stop the privileged server by using a queue
     and keep a pid file so the unprivileged user is able to send the TERM
     signal when the X session logs out.'''
     def __init__(self, server,
                  port=DEF_EXPORTS_PORT,
                  nbd_timeout=DEF_NBD_TIMEOUT,
+                 config_file=DEF_CONFIG_FILE,
+                 lock_file=DEF_LOCK_FILE,
                  nbd_client_binary=DEF_NBD_CLIENT,
                  udevadm_binary=DEF_UDEVADM,
                  poll_interval=DEF_POLL_INTERVAL,
                  block_size=DEF_BLOCK_SIZE,
                  pid_file=DEF_PID_FILE):
+        self.leave = False
         self.queue = mp.Queue()
         self.pid_file = os.path.join(
             pwd.getpwuid(int(os.environ[SUDO_UID])).pw_dir,
-            os.path.split(pid_file)[1])
+            '%s-%s-%s' % (os.path.split(pid_file)[1].strip(),
+                          server.strip(),
+                          socket.gethostname().lower()))
         self.worker = Worker(self.queue,
-            server, port, nbd_timeout, nbd_client_binary,
-            udevadm_binary, poll_interval, block_size)
+            server, port, nbd_timeout, config_file, lock_file,
+            nbd_client_binary, udevadm_binary, poll_interval,
+            block_size)
         self._drop_privileges()
         # Unprivileged after here
-        self.lock = threading.Lock()
-        self.lock.acquire()
         signal.signal(signal.SIGTERM, self.signal_term)
+        self.event = threading.Event()
+        self.event.clear()
         open(self.pid_file, 'w+').write('%d\n' % os.getpid())
-        self.lock.acquire()
+        self.run()
 
     def _drop_privileges(self):
-        'Drop user privileges to the nbbwrapper user and group'
+        'Drop user privileges to the calling user and group'
         os.setgroups([])
         os.setgid(int(os.environ[SUDO_GID]))
         os.setuid(int(os.environ[SUDO_UID]))
         os.umask(0o077)
 
     def signal_term(self, signum, frame):
-        '''Listen for the TERM signal and send a None on
-        the worker Queue to stop it. After that we realease the lock
-        and leave the program.'''
+        '''Listen for the TERM signal and push a None object on
+        the worker queue to stop the privileged process.
+        After that we set the event and leave the program.'''
         self.queue.put(None)
-        self.lock.release()
+        self.leave = True
+        self.event.set()
         try: os.unlink(self.pid_file)
         except OSError: pass
+
+    def run(self):
+        'Just waits for the event to be set, signaling us to exit.'
+        while not self.leave:
+            self.event.wait(LOOP_SLEEP)
+
+class MediaType(object):
+    '''Reads the media type configuration file and
+    returns the media as key=value in UDEV format.
+    This class is used to pass configuration parameters to the UDEV env.'''
+    def __init__(self,
+            config_file=DEF_CONFIG_FILE, lock_file=DEF_LOCK_FILE):
+        self.config_file = config_file
+        self.lock_file = lock_file
+
+    def print_media_type(self, device):
+        '''Reads the media type configuration file and returns
+        key=value pairs in UDEV format, included the media type.'''
+        cfg = configparser.ConfigParser()
+        try:
+            cfg.read(self.config_file)
+            keys = {
+                cfg.get(MEDIA_SECTION, device): 1,
+                'UDISKS_AUTO': 0,
+                'UDISKS_IGNORE': 0,
+                'UDISKS_SYSTEM': 0,
+                'UDISKS_PRESENTATION_HIDE': 0,
+            }
+            for key in keys:
+                sys.stdout.write('%s=%d\n' % (key, keys[key]))
+            sys.stdout.flush()
+        except configparser.Error:
+            pass
 
 def install(options):
     '''Installs this software by:
 
         + Copying this python into /usr/local/sbin
+        + Creating the wrapper shell called from sudo in /usr/local/sbin
+        + Creating the shutdown script on /usr/local/sbin
         + Installing the UDEV rules into /etc/udev/rules.d
         + Creating a modprobe file for the nbd module options
         + Configure the autoloading of the module nbd (only on Gentoo)
         + Creating a X11 xinit file for starting the client
-        + Creating the shutdown script on /usr/local/sbin
         + Linking the shutdown script in /etc/kde/shutdown
-        + Linking the shutdown script in /etc/gdm/PostSession
-        + Configure a sudoers file to let users on the plugdev group
+        + Adding the shutdown script to /etc/X11/gdm/PostSession/Default
+        + Configuring a sudoers file to let users on the 'plugdev' group
           launch the nbd wrapper client (right now root is required
           to use nbd-client and udevadm)
 
@@ -409,11 +504,16 @@ def install(options):
     client_options = {'wrapper_py' : wrapper_py, 'wrapper_sh': wrapper_sh,
                       'plugdev' : PLUGDEV_GROUP, 'port': '', 'interval': '',
                       'block': '', 'nbd': '', 'udev': '', 'timeout': '',
-                      'pid': '', 'xpid': DEF_PID_FILE}
+                      'config': '', 'lock': '', 'pid': '',
+                      'xpid': DEF_PID_FILE}
     if options.port != DEF_EXPORTS_PORT:
         client_options['port'] = ' -p %d' % options.port
     if options.poll_interval != DEF_POLL_INTERVAL:
         client_options['interval'] = ' -i %d' % options.poll_interval
+    if options.config_file != DEF_CONFIG_FILE:
+        client_options['config'] = " -C '%s'" % options.config_file
+    if options.lock_file != DEF_LOCK_FILE:
+        client_options['lock'] = " -L '%s'" % options.lock_file
     if options.block_size != DEF_BLOCK_SIZE:
         client_options['block'] = ' -b %s' % options.block_size
     if options.nbd_timeout != DEF_NBD_TIMEOUT:
@@ -423,28 +523,28 @@ def install(options):
     if options.udevadm_binary != DEF_UDEVADM:
         client_options['udev'] = " -U '%s'" % options.udevadm_binary
     if options.pid_file != DEF_PID_FILE:
-        xpid = os.path.split(options.pid_file)[1]
+        xpid = os.path.split(options.pid_file)[1].strip()
         client_options['pid'] = " -P '%s'" % xpid
         client_options['xpid'] = xpid
 
     if not os.path.isdir(udev_base):
         sys.stderr.write(
-            'ERROR: The UDEV rules directory %s does not exist.\n'
+            'ERROR: The UDEV rules directory %s does not exist.\n' \
             'Is UDEV installed on this system?\n' % udev_base)
         return 10
 
     if not os.path.exists(options.nbd_client_binary):
         sys.stderr.write(
-            'ERROR: The binary file %s does not exist.\n'
-            'Please, specify the option --nbd-client-binary '
-            'pointing to the nbd client binary.\n')
+            'ERROR: The binary file %s does not exist.\n' \
+            'Please, specify the option --nbd-client-binary ' \
+            'pointing to the nbd client binary.\n' % options.nbd_client_binary)
         return 11
 
     if not os.path.exists(options.udevadm_binary):
         sys.stderr.write(
-            'ERROR: The binary file %s does not exist.\n'
-            'Please, specify the option --udevadm-binary '
-            'pointing to the udevadm binary.\n')
+            'ERROR: The binary file %s does not exist.\n' \
+            'Please, specify the option --udevadm-binary ' \
+            'pointing to the udevadm binary.\n' % options.udevadm_binary)
         return 12
 
     # Install the client wrapper
@@ -463,7 +563,7 @@ def install(options):
             print('file %s ready.' % wrapper_py)
         except (OSError, IOError):
             sys.stderr.write(
-                'ERROR: Cannot write the file %s, '
+                'ERROR: Cannot write the file %s, ' \
                 'you should run the installer as root.\n' % wrapper_py)
             return 13
         try:
@@ -475,29 +575,43 @@ def install(options):
             print('file %s ready.' % wrapper_sh)
         except (OSError, IOError):
             sys.stderr.write(
-                'ERROR: Cannot write the file %s, '
+                'ERROR: Cannot write the file %s, ' \
                 'you should run the installer as root.\n' % wrapper_sh)
             return 13
     else:
         sys.stderr.write(
-            'ERROR: Cannot find the directory %s, '
+            'ERROR: Cannot find the directory %s, ' \
             'you should run the installer as root.\n' % base)
         return 13
+
+    # Create the shutdown script
+    try:
+        f = open(shutdown_sh, 'w')
+        os.fchown(f.fileno(), 0, 0)
+        os.fchmod(f.fileno(), 0o755)
+        f.write(SHUTDOWN_SHELL % client_options)
+        f.close()
+        print('file %s ready.' % shutdown_sh)
+    except (OSError, IOError):
+        sys.stderr.write(
+            'ERROR: Cannot write the file %s, ' \
+            'you should run the installer as root.\n' % shutdown_sh)
+        return 14
 
     # Install the UDEV rules
     try:
         f = open(udev_rules, 'w')
         os.fchown(f.fileno(), 0, 0)
         os.fchmod(f.fileno(), 0o644)
-        f.write(UDEV_RULES)
+        f.write(UDEV_RULES % client_options)
         f.close()
         os.system('udevadm control --reload')
         print('file %s ready.' % udev_rules)
     except (OSError, IOError):
         sys.stderr.write(
-            'ERROR: Cannot write the file %s, '
+            'ERROR: Cannot write the file %s, ' \
             'you should run the installer as root.\n' % udev_rules)
-        return 14
+        return 15
 
     # Create a modprobe file for the nbd options
     if os.path.isdir(modprobe_d):
@@ -511,13 +625,13 @@ def install(options):
             print('file %s ready.' % modprobe_conf)
         except (OSError, IOError):
             sys.stderr.write(
-                'ERROR: Cannot write the file %s, '
+                'ERROR: Cannot write the file %s, ' \
                 'you should run the installer as root.\n' % modprobe_conf)
-            return 15
+            return 16
     else:
         sys.stderr.write(
-            'WARNING: Cannot find the %s directory, manually configure '
-            'your distro to do a "modprobe nbd '
+            'WARNING: Cannot find the %s directory, manually configure ' \
+            'your distro to do a "modprobe nbd ' \
             'max_part=63" on boot.\n' % modprobe_d)
 
     # Try to autoload the module on boot (only on Gentoo)
@@ -535,12 +649,12 @@ def install(options):
                 print('file %s already configured.' % conf_d_modules)
         except (OSError, IOError):
             sys.stderr.write(
-                'ERROR: Cannot write %s, '
+                'ERROR: Cannot write %s, ' \
                 'you should run the installer as root.\n' % conf_d_modules)
-            return 16
+            return 17
     else:
         sys.stderr.write(
-            'WARNING: Cannot find the %s file, manually configure '
+            'WARNING: Cannot find the %s file, manually configure ' \
             'your distro to do a "modprobe nbd" on boot.\n' % conf_d_modules)
 
     # Create a xinit script to start the nbd wrapper client
@@ -555,28 +669,14 @@ def install(options):
             print('file %s ready.' % xinit_client)
         except (OSError, IOError):
             sys.stderr.write(
-                'ERROR: Cannot write the file %s, '
+                'ERROR: Cannot write the file %s, ' \
                 'you should run the installer as root.\n' % xinit_client)
-            return 17
+            return 18
     else:
         sys.stderr.write(
-            'WARNING: Cannot find the %s directory, manually create '
+            'WARNING: Cannot find the %s directory, manually create ' \
             'a xinit file with this content:\n' % xinit_rc_d)
         sys.stderr.write(XINIT_CLIENT % client_options)
-
-    # Create the shutdown script
-    try:
-        f = open(shutdown_sh, 'w')
-        os.fchown(f.fileno(), 0, 0)
-        os.fchmod(f.fileno(), 0o755)
-        f.write(SHUTDOWN_SHELL % client_options)
-        f.close()
-        print('file %s ready.' % shutdown_sh)
-    except (OSError, IOError):
-        sys.stderr.write(
-            'ERROR: Cannot write the file %s, '
-            'you should run the installer as root.\n' % shutdown_sh)
-        return 18
 
     # Link the shutdown script on /etc/kde/shutdown
     kde_shutdown_link = os.path.join(
@@ -589,7 +689,7 @@ def install(options):
             print('link %s already done.' % kde_shutdown_link)
     else:
         sys.stderr.write(
-            'WARNING: Cannot find the %s directory, manually link '
+            'WARNING: Cannot find the %s directory, manually link ' \
             'the %s script in the KDE shutdown directory.\n' % (
                 kde_shutdown, shutdown_sh))
 
@@ -612,12 +712,12 @@ def install(options):
                 print('file %s already done.' % gdm_shutdown)
         except (OSError, IOError):
             sys.stderr.write(
-                'ERROR: Cannot write the file %s, '
+                'ERROR: Cannot write the file %s, ' \
                 'you should run the installer as root.\n' % gdm_shutdown)
-            return 13
+            return 19
     else:
         sys.stderr.write(
-            'WARNING: Cannot find the %s directory, manually add '
+            'WARNING: Cannot find the %s directory, manually add ' \
             'the %s script to the GDM PostSession/Default script.\n' % (
                 gdm_shutdown, shutdown_sh))
 
@@ -629,25 +729,28 @@ def install(options):
             os.fchmod(f.fileno(), 0o440)
             f.write(SUDOERS_LINE % client_options)
             f.close()
-            os.system("VISUAL=/usr/bin/touch visudo -f '%s'" % sudo_file)
+            os.system(
+                "VISUAL=/usr/bin/touch visudo -f '%s'&>/dev/null" % sudo_file)
             print('file %s ready.' % sudo_file)
         except (OSError, IOError):
             sys.stderr.write(
-                'ERROR: Cannot write the file %s, '
+                'ERROR: Cannot write the file %s, ' \
                 'you should run the installer as root.\n' % sudo_file)
-            return 19
+            return 20
     else:
         sys.stderr.write(
-            'WARNING: Cannot find the %s directory, manually '
+            'WARNING: Cannot find the %s directory, manually ' \
             'add this line to the /etc/sudoers file:\n' % sudoers_d)
         sys.stderr.write(SUDOERS_LINE % client_options)
 
     print('''
 You can add these lines to the syslog-ng.conf file just under the
-"source src {...}" section because the nbd-server could get very verbose:
+"source src {...}" section because the nbd-client could get very verbose:
 
- destination discard { file("/dev/null" owner(root) group(root) perm(0666) dir_perm(0755) create_dirs(no)); };
- filter nbd { program("nbd_server"); };
+ destination discard {
+    file("/dev/null" perm(0666) dir_perm(0755) create_dirs(no));
+ };
+ filter nbd { program("nbd_client"); };
  log { source(src); filter(nbd); destination(discard); flags(final); };
 ''')
 
@@ -674,6 +777,14 @@ under certain conditions.''', version='%%prog %s' % __version__)
     parser.add_option('-t', '--nbd-timeout', dest='nbd_timeout',
                         type='int', default=DEF_NBD_TIMEOUT,
                         help='nbd-client timeout connecting')
+    parser.add_option('-m', '--media-type', dest='media_type', default=None,
+                        help='output media type for device in UDEV format')
+    parser.add_option('-C', '--cfg', dest='config_file', action='store',
+                        default=DEF_CONFIG_FILE,
+                        help='the dynamic media type configuration file')
+    parser.add_option('-L', '--lock', dest='lock_file', action='store',
+                        default=DEF_LOCK_FILE,
+                        help='lock file serializing parallel actions')
     parser.add_option('-N', '--nbd-client-binary', dest='nbd_client_binary',
                         action='store', default=DEF_NBD_CLIENT,
                         help='the nbd-client binary file')
@@ -682,15 +793,19 @@ under certain conditions.''', version='%%prog %s' % __version__)
                         help='the udevadm binary file')
     parser.add_option('-P', '--pid-file', dest='pid_file',
                         action='store', default=DEF_PID_FILE,
-                        help='the pid file name (always under $HOME)')
+                        help='the base pid file name (always under $HOME)')
     parser.add_option('-I', '--install', dest='install', action='store_true',
                         default=False,
                         help='installs this software')
     (options, args) = parser.parse_args()
 
     ret = 0
-    if options.server != None:
+    if options.media_type != None:
+        MediaType(options.config_file,
+            options.lock_file).print_media_type(options.media_type)
+    elif options.server != None:
         worker = Client(options.server, options.port, options.nbd_timeout,
+                        options.config_file, options.lock_file,
                         options.nbd_client_binary, options.udevadm_binary,
                         options.poll_interval, options.block_size,
                         options.pid_file)
